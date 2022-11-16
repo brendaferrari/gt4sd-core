@@ -21,150 +21,488 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-"""Regression Transformer training utilities."""
-import os
-from dataclasses import dataclass, field
-from typing import Optional
+"""RegressionTransformer algorithm.
 
-from ...configuration import gt4sd_configuration_instance
-from ..core import TrainingPipelineArguments
-from .utils import TransformersTrainingArgumentsCLI
+RegressionTransformer is a mutlitask regression and conditional generation model.
+"""
 
-DATA_ROOT = os.path.join(
-    gt4sd_configuration_instance.gt4sd_local_cache_path, "data", "RegressionTransformer"
-)
-os.makedirs(DATA_ROOT, exist_ok=True)
+import logging
+from dataclasses import field
+from typing import Any, Callable, ClassVar, Dict, Iterable, Optional, TypeVar, Union
+
+from typing_extensions import Protocol, runtime_checkable
+
+from ....domains.materials import Molecule, Sequence
+from ....exceptions import InvalidItem
+from ....properties.core import PropertyValue
+from ....training_pipelines.core import TrainingPipelineArguments
+from ....training_pipelines.regression_transformer.core import RegressionTransformerSavingArguments
+from ...core import AlgorithmConfiguration, GeneratorAlgorithm
+from ...registry import ApplicationsRegistry
+from .implementation import ChemicalLanguageRT, ConditionalGenerator, ProteinLanguageRT
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+T = TypeVar("T", bound=Sequence)
+S = TypeVar("S", PropertyValue, Molecule)
+Targeted = Callable[[T], Iterable[Any]]
 
 
-@dataclass
-class RegressionTransformerTrainingArguments(
-    TrainingPipelineArguments, TransformersTrainingArgumentsCLI
-):
+class RegressionTransformer(GeneratorAlgorithm[S, T]):
+    """RegressionTransformer Algorithm."""
+
+    #: The maximum number of samples a user can try to run in one go
+    max_samples: int = 50
+
+    def __init__(
+        self,
+        configuration: AlgorithmConfiguration[S, T],
+        target: Optional[T],
+    ) -> None:
+        """Instantiate Regression Transformer ready to generate items.
+
+        Args:
+            configuration: domain and application
+                specification defining parameters, types and validations.
+            target: a target for which to generate items.
+
+        Example:
+            An example for generating small molecules (SMILES) with high affinity for a target protein::
+
+                config = RegressionTransformerProteins(
+                    search='sample', temperature=2.0, tolerance=10
+                )
+                target = "<stab>0.393|GSQEVNSGT[MASK][MASK][MASK]YKNASPEEAE[MASK][MASK]IARKAGATTWTEKGNKWEIRI"
+                stability_generator = RegressionTransformer(configuration=config, target=target)
+                items = list(stability_generator.sample(10))
+                print(items)
+        """
+
+        configuration = self.validate_configuration(configuration)
+
+        # No validation/check on the target input here, since model is not yet loaded.
+        super().__init__(
+            configuration=configuration,  # type:ignore
+            target=target,  # type:ignore
+        )
+
+    def get_generator(
+        self,
+        configuration: AlgorithmConfiguration[S, T],
+        target: Optional[T],
+    ) -> Targeted[T]:
+        """Get the function to sample with the given configuration.
+
+        Args:
+            configuration: helps to set up specific application of PaccMannRL.
+            target: context or condition for the generation.
+
+        Returns:
+            callable with target generating a batch of items.
+        """
+        logger.info("ensure artifacts for the application are present.")
+        self.local_artifacts = configuration.ensure_artifacts()
+        implementation: ConditionalGenerator = configuration.get_conditional_generator(  # type: ignore
+            resources_path=self.local_artifacts, context=target
+        )
+        if implementation.task == "regression" and configuration.search == "greedy":  # type: ignore
+            self.max_samples = 1
+            logger.warning(
+                "max_samples was set to 1 due to regression task and greedy search"
+            )
+
+        return implementation.generate_batch  # type: ignore
+
+    def validate_configuration(
+        self, configuration: AlgorithmConfiguration[S, T]
+    ) -> AlgorithmConfiguration[S, T]:
+        @runtime_checkable
+        class AnyRegressionTransformerConfiguration(Protocol):
+            """Protocol for RegressionTransformer configurations."""
+
+            def get_conditional_generator(
+                self, resources_path: str
+            ) -> ConditionalGenerator:
+                ...
+
+            def validate_item(self, item: Any) -> S:
+                ...
+
+        # TODO raise InvalidAlgorithmConfiguration
+        assert isinstance(configuration, AnyRegressionTransformerConfiguration)
+        assert isinstance(configuration, AlgorithmConfiguration)
+        return configuration
+
+
+@ApplicationsRegistry.register_algorithm_application(RegressionTransformer)
+class RegressionTransformerMolecules(AlgorithmConfiguration[Sequence, Sequence]):
     """
-    Arguments related to RegressionTransformer trainer.
-    NOTE: All arguments from `transformers.training_args.TrainingArguments` can be used.
-    Only additional ones are specified below.
+    Configuration to generate molecules given a continuous property target and a molecular sub-structure.
+
+    Implementation from the paper: https://arxiv.org/abs/2202.01338.
+
+    Examples:
+        An example for generating a peptide around a desired property value::
+
+            config = RegressionTransformerMolecules(
+                algorithm_version='solubility', search='sample', temperature=2, tolerance=5
+            )
+            target = "<esol>-3.534|[Br][C][=C][C][MASK][MASK][=C][C][=C][C][=C][Ring1][MASK][MASK][Branch2_3][Ring1][Branch1_2]"
+            solubility_generator = RegressionTransformer(
+                configuration=config, target=target
+            )
+            list(solubility_generator.sample(5))
+
+        An example for predicting the solubility of a molecule::
+
+            config = RegressionTransformerMolecules(
+                algorithm_version='solubility', search='greedy'
+            )
+            target = "<esol>[MASK][MASK][MASK][MASK][MASK]|[Cl][C][Branch1_2][Branch1_2][=C][Branch1_1][C][Cl][Cl][Cl]"
+            solubility_generator = RegressionTransformer(
+                configuration=config, target=target
+            )
+            list(solubility_generator.sample(1))
     """
 
-    __name__ = "training_args"
-
-    training_name: str = field(
-        default="rt_training", metadata={"help": "Name used to identify the training."}
-    )
-    epochs: int = field(default=10, metadata={"help": "Number of epochs."})
-    batch_size: int = field(default=16, metadata={"help": "Size of the batch."})
-    log_interval: int = field(
-        default=100, metadata={"help": "Number of steps between log intervals."}
-    )
-    gradient_interval: int = field(
-        default=1, metadata={"help": "Gradient accumulation steps"}
+    algorithm_type: ClassVar[str] = "conditional_generation"
+    domain: ClassVar[str] = "materials"
+    algorithm_version: str = field(
+        default="solubility",
+        metadata=dict(
+            description="The version of the algorithm to use.",
+            options=["solubility", "qed", "logp_and_synthesizability"],
+        ),
     )
 
-    max_span_length: int = field(
-        default=5, metadata={"help": "Max length of a span of masked tokens for PLM."}
-    )
-    plm_probability: float = field(
-        default=1 / 6,
-        metadata={
-            "help": "Ratio of length of a span of masked tokens to surrounding context length for PLM."
-        },
-    )
-    alternate_steps: int = field(
-        default=50,
-        metadata={
-            "help": "Per default, training alternates between property prediction and "
-            "conditional generation. This argument specifies the alternation frequency."
-            "If you set it to 0, no alternation occurs and we fall back to vanilla "
-            "permutation language modeling (PLM). Default: 50."
-        },
-    )
-    cc_loss: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether the cycle-consistency loss is computed during the conditional "
-            "generation task. Defaults to True."
-        },
-    )
-    cg_collator: str = field(
-        default="vanilla_cg",
-        metadata={
-            "help": "The collator class. Following options are implemented: "
-            "'vanilla_cg': Collator class that does not mask the properties but anything else as a regular DataCollatorForPermutationLanguageModeling. Can optionally replace the properties with sampled values. "
-            "NOTE: This collator can deal with multiple properties. "
-            "'multientity_cg': A training collator the conditional-generation task that can handle multiple entities. "
-            "Default: vanilla_cg."
-        },
-    )
-    entity_to_mask: int = field(
-        default=-1,
-        metadata={
-            "help": "Only applies if `cg_collator='multientity_cg'`. The entity that is being masked during training. 0 corresponds to first entity and so on. -1 corresponds to "
-            "a random sampling scheme where the entity-to-be-masked is determined "
-            "at runtime in the collator. NOTE: If 'mask_entity_separator' is true, "
-            "this argument will not have any effect. Defaults to -1."
-        },
-    )
-    entity_separator_token: str = field(
-        default=".",
-        metadata={
-            "help": "Only applies if `cg_collator='multientity_cg'`.The token that is used to separate "
-            "entities in the input. Defaults to '.' (applicable to SMILES & SELFIES)"
-        },
-    )
-    mask_entity_separator: bool = field(
-        default=False,
-        metadata={
-            "help": "Only applies if `cg_collator='multientity_cg'`. Whether or not the entity separator token can be masked. If True, *all** textual tokens can be masked and we "
-            "the collator behaves like the `vanilla_cg ` even though it is a `multientity_cg`. If False, the exact behavior "
-            "depends on the entity_to_mask argument. Defaults to False."
-        },
+    search: str = field(
+        default="sample",
+        metadata=dict(
+            description="Search algorithm to use for the generation: sample or greedy",
+            options=["sample", "greedy"],
+        ),
     )
 
-
-@dataclass
-class RegressionTransformerDataArguments(TrainingPipelineArguments):
-    """Arguments related to RegressionTransformer data loading."""
-
-    __name__ = "dataset_args"
-
-    train_data_path: str = field(
-        metadata={
-            "help": "Path to a `.csv` file with the input training data. The file has to "
-            "contain a `text` column (with the string input, e.g, SMILES, AAS, natural "
-            "text) and an arbitrary number of numerical columns."
-        },
+    temperature: float = field(
+        default=1.4,
+        metadata=dict(
+            description="Temperature parameter for the softmax sampling in decoding."
+        ),
     )
-    test_data_path: str = field(
-        metadata={
-            "help": "Path to a `.csv` file with the input testing data. The file has to "
-            "contain a `text` column (with the string input, e.g, SMILES, AAS, natural "
-            "text) and an arbitrary number of numerical columns."
-        },
+    batch_size: int = field(
+        default=8,
+        metadata=dict(description="Batch size for the conditional generation"),
     )
-    augment: Optional[int] = field(
-        default=0,
-        metadata={
-            "help": "Factor by which the training data is augmented. The data modality "
-            "(SMILES, SELFIES, AAS, natural text) is inferred from the tokenizer. "
-            "NOTE: For natural text, no augmentation is supported. Defaults to 0, "
-            "meaning no augmentation. "
-        },
+    tolerance: Union[float, Dict[str, float]] = field(
+        default=20.0,
+        metadata=dict(
+            description="""Precision tolerance for the conditional generation task. This is the
+            tolerated eviation between desired/primed property and predicted property of the
+            generated molecule. Given in percentage with respect to the property range encountered
+            during training. Either a single float or a dict of floats with properties as
+            NOTE: The tolerance is *only* used for post-hoc filtering of the generated molecules.
+            """
+        ),
+    )
+    sampling_wrapper: Dict = field(
+        default_factory=dict,
+        metadata=dict(
+            description="""High-level entry point for SMILES-level access. Provide a
+            dictionary that is used to build a custom sampling wrapper.
+            NOTE: If this is used, the `target` needs to be a single SMILES string.
+            Example: {
+                'fraction_to_mask': 0.5,
+                'atoms_to_mask': [],
+                'property_goal': {'<qed>': 0.85}
+            }
+            - 'fraction_to_mask' specifies the ratio of tokens that can be changed by
+                the model.
+            - 'atoms_to_mask' specifies which atoms can be masked. This defaults
+                to an empty list, meaning that all tokens can be masked.
+            - 'property_goal' specifies the target conditions for the generation. The
+                properties need to be specified as a dictionary. The keys need to be
+                properties supported by the algorithm version.
+            - 'substructures_to_mask': Specifies a list of substructures that should be masked.
+                Given in SMILES format. This is excluded from the stochastic masking.
+                NOTE: The model operates on SELFIES and the matching of the substructures occurs
+                in SELFIES simply on a string level.
+            - 'substructures_to_keep': Specifies a list of substructures that should definitely be kept.
+                Given in SMILES format. This is excluded from the stochastic masking.
+                NOTE: This keeps tokens even if they are included in `tokens_to_mask`.
+                NOTE: The model operates on SELFIES and the matching of the substructures occurs
+                in SELFIES simply on a string level.
+            - `text_filtering`: Generated sequences are post-hoc filtered for the presence of
+                `substructures_to_keep`. This is done with RDKit substructure matches. If the sub-
+                structure cant be converted to a mol object, this argument toggles whether a substructure
+                should be ignored from post-hoc filtering (this happens per default) or whether
+                filtering should occur on a pure string level. Defaults to False.
+                NOTE: This does not affect the actual generation process.
+            """
+        ),
     )
 
-    line_by_line: Optional[bool] = field(
-        default=True,
-        metadata={
-            "help": "Whether lines of text in the dataset are to be handled as distinct samples."
-        },
+    def get_target_description(self) -> Dict[str, str]:
+        """Get description of the target for generation.
+
+        Returns:
+            target description.
+        """
+        return {
+            "title": "Masked input sequence",
+            "description": (
+                "A sequence with a property value and a SELFIES string. Masking can either occur on the property or on the SELFIES, but not both."
+                "For the scale of the property values, please see the task/dataset."
+            ),
+            "type": "string",
+        }
+
+    def get_conditional_generator(
+        self, resources_path: str, context: str
+    ) -> ChemicalLanguageRT:
+        """Instantiate the actual generator implementation.
+
+        Args:
+            resources_path: local path to model files.
+
+        Returns:
+            instance with :meth:`generate_batch<gt4sd.algorithms.conditional_generation.regression_transformer.implementation.ChemicalLanguageRT.generate_batch>` method for targeted generation.
+        """
+        self.generator = ChemicalLanguageRT(
+            resources_path=resources_path,
+            context=context,
+            search=self.search,
+            temperature=self.temperature,
+            batch_size=self.batch_size,
+            tolerance=self.tolerance,
+            sampling_wrapper=self.sampling_wrapper,
+        )
+        return self.generator
+
+    def validate_item(self, item: str) -> Union[Molecule, Sequence]:  # type: ignore
+        """Check that item is a valid sequence.
+
+        Args:
+            item: a generated item that is possibly not valid.
+
+        Raises:
+            InvalidItem: in case the item can not be validated.
+
+        Returns:
+            the validated item.
+        """
+        if item is None:
+            raise InvalidItem(title="InvalidSequence", detail="Sequence is None")
+        (
+            items,
+            _,
+        ) = self.generator.validate_output([item])
+        if items[0] is None:
+            if self.generator.task == "generation":
+                title = "InvalidSMILES"
+                detail = f'rdkit.Chem.MolFromSmiles returned None for "{item}"'
+            else:
+                title = "InvalidNumerical"
+                detail = f'"{item}" is not a valid floating point number'
+            raise InvalidItem(title=title, detail=detail)
+        return item
+
+    @classmethod
+    def get_filepath_mappings_for_training_pipeline_arguments(
+        cls, training_pipeline_arguments: TrainingPipelineArguments
+    ) -> Dict[str, str]:
+        """Ger filepath mappings for the given training pipeline arguments.
+
+        Args:
+            training_pipeline_arguments: training pipeline arguments.
+
+        Returns:
+            a mapping between artifacts' files and training pipeline's output files.
+        """
+        if isinstance(training_pipeline_arguments, RegressionTransformerSavingArguments):
+            return {
+                "pytorch_model.bin": training_pipeline_arguments.model_path
+            }
+        else:
+            return super().get_filepath_mappings_for_training_pipeline_arguments(
+                training_pipeline_arguments
+            )
+
+
+@ApplicationsRegistry.register_algorithm_application(RegressionTransformer)
+class RegressionTransformerProteins(AlgorithmConfiguration[Sequence, Sequence]):
+    """
+    Configuration to generate protein given a continuous property target and a partial AAs.
+
+    Implementation from the paper: https://arxiv.org/abs/2202.01338. It can also predict the property given a full sequence.
+
+    Examples:
+        An example for generating a peptide around a desired property value::
+
+            config = RegressionTransformerProteins(
+                search='sample', temperature=2, tolerance=5
+            )
+            target = "<stab>1.1234|TTIKNG[MASK][MASK][MASK]YTVPLSPEQAAK[MASK][MASK][MASK]KKRWPDYEVQIHGNTVKVT"
+            stability_generator = RegressionTransformer(
+                configuration=config, target=target
+            )
+            list(stability_generator.sample(5))
+
+        An example for predicting the stability of a peptide::
+
+            config = RegressionTransformerProteins(search='greedy')
+            target = "<stab>[MASK][MASK][MASK][MASK][MASK]|GSQEVNSNASPEEAEIARKAGATTWTEKGNKWEIRI"
+            stability_generator = RegressionTransformer(
+                configuration=config, target=target
+            )
+            list(stability_generator.sample(1))
+    """
+
+    algorithm_type: ClassVar[str] = "conditional_generation"
+    domain: ClassVar[str] = "materials"
+    algorithm_version: str = field(
+        default="stability",
+        metadata=dict(
+            description="The version of the algorithm to use.",
+            options=["stability"],
+        ),
     )
 
-
-@dataclass
-class RegressionTransformerSavingArguments(TrainingPipelineArguments):
-    """Saving arguments related to RegressionTransformer trainer."""
-
-    __name__ = "saving_args"
-
-    model_path: str = field(
-        metadata={"help": "Path where the model artifacts are stored."}
+    search: str = field(
+        default="sample",
+        metadata=dict(
+            description="Search algorithm to use for the generation: sample or greedy"
+        ),
     )
+
+    temperature: float = field(
+        default=1.4,
+        metadata=dict(
+            description="Temperature parameter for the softmax sampling in decoding."
+        ),
+    )
+    batch_size: int = field(
+        default=32,
+        metadata=dict(description="Batch size for the conditional generation"),
+    )
+    tolerance: Union[float, Dict[str, float]] = field(
+        default=20.0,
+        metadata=dict(
+            description="""Precision tolerance for the conditional generation task. This is the
+            tolerated eviation between desired/primed property and predicted property of the
+            generated molecule. Given in percentage with respect to the property range encountered
+            during training. Either a single float or a dict of floats with properties as
+            NOTE: The tolerance is *only* used for post-hoc filtering of the generated proteins.
+            """
+        ),
+    )
+    sampling_wrapper: Dict = field(
+        default_factory=dict,
+        metadata=dict(
+            description="""High-level entry point for SMILES-level access. Provide a
+            dictionary that is used to build a custom sampling wrapper.
+            NOTE: If this is used, the `target` needs to be a single SMILES string.
+            Example: {
+                'fraction_to_mask': 0.5,
+                'atoms_to_mask': [],
+                'property_goal': {'<qed>': 0.85}
+            }
+            - 'fraction_to_mask' specifies the ratio of tokens that can be changed by
+                the model.
+            - 'atoms_to_mask' specifies which atoms can be masked. This defaults
+                to an empty list, meaning that all tokens can be masked.
+            - 'property_goal' specifies the target conditions for the generation. The
+                properties need to be specified as a dictionary. The keys need to be
+                properties supported by the algorithm version.
+            """
+        ),
+    )
+
+    def get_target_description(self) -> Dict[str, str]:
+        """Get description of the target for generation.
+
+        Returns:
+            target description.
+        """
+        return {
+            "title": "Masked input sequence",
+            "description": "A sequence with a property value and an AAS. Masking can either occur on the property or on the AAS, but not both.",
+            "type": "string",
+        }
+
+    def get_conditional_generator(
+        self, resources_path: str, context: str
+    ) -> ProteinLanguageRT:
+        """Instantiate the actual generator implementation.
+
+        Args:
+            resources_path: local path to model files.
+            context: input sequence to be used for the generation.
+
+        Returns:
+            instance with :meth:`generate_batch<gt4sd.algorithms.conditional_generation.regression_transformer.implementation.ProteinLanguageRT.generate_batch>` method for targeted generation.
+        """
+
+        self.generator = ProteinLanguageRT(
+            resources_path=resources_path,
+            search=self.search,
+            temperature=self.temperature,
+            context=context,
+            batch_size=self.batch_size,
+            tolerance=self.tolerance,
+            sampling_wrapper=self.sampling_wrapper,
+        )
+        return self.generator
+
+    def validate_item(self, item: str) -> Union[Molecule, Sequence]:  # type: ignore
+        """Check that item is a valid sequence.
+
+        Args:
+            item: a generated item that is possibly not valid.
+
+        Raises:
+            InvalidItem: in case the item can not be validated.
+
+        Returns:
+            the validated item.
+        """
+        if item is None:
+            raise InvalidItem(title="InvalidSequence", detail="Sequence is None")
+        (
+            items,
+            _,
+        ) = self.generator.validate_output([item])
+        if items[0] is None:
+            if self.generator.task == "generation":
+                title = "InvalidSequence"
+                detail = f'"{item}" does not adhere to IUPAC convention for AAS'
+            else:
+                title = "InvalidNumerical"
+                detail = (
+                    f'"{item}" is not a valid Sequence with a floating point number'
+                )
+            raise InvalidItem(title=title, detail=detail)
+        return item
+
+    @classmethod
+    def get_filepath_mappings_for_training_pipeline_arguments(
+        cls, training_pipeline_arguments: TrainingPipelineArguments
+    ) -> Dict[str, str]:
+        """Ger filepath mappings for the given training pipeline arguments.
+
+        Args:
+            training_pipeline_arguments: training pipeline arguments.
+
+        Returns:
+            a mapping between artifacts' files and training pipeline's output files.
+        """
+        if isinstance(training_pipeline_arguments, RegressionTransformerSavingArguments):
+            return {
+                "pytorch_model.bin": training_pipeline_arguments.model_path
+            }
+        else:
+            return super().get_filepath_mappings_for_training_pipeline_arguments(
+                training_pipeline_arguments
+            )
+
+
